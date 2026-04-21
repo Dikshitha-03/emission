@@ -41,18 +41,22 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
     Load a JSON or JSON.GZ dataset using ijson for true C-speed streaming.
 
     Supports two layouts automatically:
-      - Django fixture  [ {"model":..., "fields": {"activity_id": ...}}, ... ]
-      - Flat array      [ {"activity_id": ...}, ... ]
+      - Django fixture  [ {"model":..., "fields": {...}}, ... ]
+      - Flat array      [ {"activity_id": ..., ...}, ... ]
 
-    Only extracts the `activity_id` field — ignores all other data so RAM
-    usage is O(chunksize), not O(file size).
+    Extracts ALL fields from each record (not just activity_id), so that
+    downstream steps can work with the full record data.
+
+    NOTE: activity_id values are NOT unique — the same activity_id can appear
+    multiple times across records with different field values (e.g. different
+    year, region, factor). Each record is retained as a distinct row.
 
     Args:
         filepath:  Path to the dataset file (.json or .json.gz).
         chunksize: Records per batch before flushing to DataFrame chunks.
 
     Returns:
-        DataFrame with an `activity_id` column.
+        DataFrame with an `activity_id` column plus all other extracted fields.
 
     Raises:
         FileNotFoundError: File does not exist.
@@ -86,31 +90,47 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
         logger.info(f"  Parsed {total:,} records ...")
         buffer.clear()
 
-    # Django fixture:  item.fields.activity_id
-    # Flat array:      item.activity_id
-    CANDIDATE_PREFIXES = (
-        "item.fields.activity_id",
-        "item.activity_id",
-    )
-    detected_prefix = None
+    # ── Format detection ──────────────────────────────────────────────────────
+    # Django fixture: each top-level item has a "fields" object containing all
+    # the record data (including activity_id).
+    # Flat array: each item is directly the record dict.
+    #
+    # We use ijson.items() to pull each top-level array element as a complete
+    # Python dict, then normalise to a flat record. This is slightly less
+    # memory-efficient than event-streaming, but still O(chunksize) peak RAM
+    # and avoids complex state machines for nested objects.
+
+    IS_FIXTURE_KEY = "fields"   # Django fixture marker
 
     try:
         with open_fn(filepath, "rb") as f:
-            for prefix, event, value in ijson.parse(f, use_float=True):
-                if event != "string":
+            detected_format = None
+            for raw_item in ijson.items(f, "item"):
+                if not isinstance(raw_item, dict):
                     continue
 
-                if detected_prefix is None:
-                    if prefix in CANDIDATE_PREFIXES:
-                        detected_prefix = prefix
-                        logger.info(f"  Detected format prefix: '{detected_prefix}'")
+                # Detect format on first item
+                if detected_format is None:
+                    if IS_FIXTURE_KEY in raw_item and isinstance(raw_item[IS_FIXTURE_KEY], dict):
+                        detected_format = "fixture"
                     else:
-                        continue
+                        detected_format = "flat"
+                    logger.info(f"  Detected format: '{detected_format}'")
 
-                if prefix != detected_prefix:
+                # Flatten to a single record dict
+                if detected_format == "fixture":
+                    record: dict = dict(raw_item.get(IS_FIXTURE_KEY, {}))
+                    # Carry over top-level fixture keys (pk, model) as metadata
+                    if "pk" in raw_item:
+                        record.setdefault("_pk", raw_item["pk"])
+                else:
+                    record = dict(raw_item)
+
+                # Must have an activity_id to be useful
+                if "activity_id" not in record:
                     continue
 
-                buffer.append({"activity_id": value})
+                buffer.append(record)
                 if len(buffer) >= chunksize:
                     _flush()
 
@@ -127,7 +147,10 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
         )
 
     df = pd.concat(chunks, ignore_index=True)
-    logger.info(f"Loaded {len(df):,} records.")
+    logger.info(
+        f"Loaded {len(df):,} raw records "
+        f"({df['activity_id'].nunique():,} distinct activity_ids before deduplication)."
+    )
     return df
 
 
@@ -167,6 +190,37 @@ def filter_by_keyword(df: pd.DataFrame, keywords: str | list[str]) -> pd.DataFra
 
     logger.info(f"Found {len(filtered):,} matching records out of {len(df):,}.")
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Deduplication
+# ---------------------------------------------------------------------------
+
+def deduplicate_activity_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce the DataFrame to one row per unique activity_id.
+
+    When the same activity_id appears across multiple records (e.g. different
+    year, region, or factor in a Django fixture), only the first occurrence is
+    kept. All subsequent pipeline steps (parse, clean, aggregate) operate on
+    the deduplicated set, so each structural pattern in the ID is processed
+    exactly once.
+
+    Args:
+        df: DataFrame with an `activity_id` column (may contain duplicates).
+
+    Returns:
+        DataFrame with duplicate activity_ids dropped, index reset.
+    """
+    before = len(df)
+    df_dedup = df.drop_duplicates(subset=["activity_id"]).reset_index(drop=True)
+    after = len(df_dedup)
+    dropped = before - after
+    logger.info(
+        f"Deduplicated activity_ids: {before:,} rows → {after:,} unique IDs "
+        f"({dropped:,} duplicates removed)."
+    )
+    return df_dedup
 
 
 # ---------------------------------------------------------------------------
@@ -454,12 +508,13 @@ def run_pipeline(
 
     Steps:
       1. Load the compressed JSON dataset.
-      2. Filter rows by keyword(s) in `activity_id`.
-      3. Parse each `activity_id` into structured key-value pairs.
-      4. Clean and normalise values.
-      5. Normalise numeric/range attributes.
-      6. Aggregate unique values per attribute.
-      7. Save output JSON and return the result dict.
+      2. Deduplicate rows so activity_id is unique (first occurrence kept).
+      3. Filter rows by keyword(s) in `activity_id`.
+      4. Parse each `activity_id` into structured key-value pairs.
+      5. Clean and normalise values.
+      6. Normalise numeric/range attributes.
+      7. Aggregate unique values per attribute.
+      8. Save output JSON and return the result dict.
 
     Args:
         filepath:   Path to the .json.gz (or .json) dataset file.
@@ -488,13 +543,20 @@ def run_pipeline(
     # ── Step 1: Load ──────────────────────────────────────────────
     df = load_data(filepath, chunksize=chunksize)
 
-    # ── Step 2: Filter ────────────────────────────────────────────
+    # ── Step 2: Deduplicate ───────────────────────────────────────
+    # activity_id is not unique in the raw dataset — the same ID can appear
+    # across multiple records (different year/region/factor). Dedup first so
+    # all downstream operations work on one row per structural pattern.
+    df = deduplicate_activity_ids(df)
+
+    # ── Step 3: Filter ────────────────────────────────────────────
     filtered_df = filter_by_keyword(df, keywords)
     if filtered_df.empty:
         logger.warning("No records matched the given keyword(s). Exiting.")
         return {}
 
-    # ── Step 3 & 4 & 5: Parse → Clean → Normalise ─────────────────
+    # ── Step 4 & 5 & 6: Parse → Clean → Normalise ────────────────
+    # Each activity_id is now unique after Step 2 deduplication.
     logger.info("Parsing and cleaning activity_id fields …")
     parsed_records = []
     skipped = 0
@@ -507,16 +569,16 @@ def run_pipeline(
             skipped += 1
 
     logger.info(
-        f"Parsed {len(parsed_records):,} records "
+        f"Parsed {len(parsed_records):,} unique activity_ids "
         f"({skipped} skipped due to missing/malformed activity_id)."
     )
 
-    # ── Step 6: Aggregate ─────────────────────────────────────────
+    # ── Step 7: Aggregate ─────────────────────────────────────────
     logger.info("Aggregating unique attribute values …")
     result = aggregate_attributes(parsed_records)
     logger.info(f"Aggregated {len(result)} distinct attributes.")
 
-    # ── Step 7: Output ────────────────────────────────────────────
+    # ── Step 8: Output ────────────────────────────────────────────
     keyword_tag = (
         keywords if isinstance(keywords, str)
         else "_".join(keywords)

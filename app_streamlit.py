@@ -4,18 +4,15 @@ Streamlit App — Emission Factors Pipeline Explorer
 Run with:
     streamlit run app_streamlit.py
 
-Key fix in this version:
-    Streamlit re-runs the entire script on every interaction (button click,
-    slider move, etc.). When the button is clicked, the file uploader widget
-    resets and uploaded_file becomes None — this is why you saw
-    "Please upload a dataset file" even though the file was there.
-
-    Fix: save the file to st.session_state as soon as it is uploaded,
-    BEFORE the button is clicked. The session_state persists across re-runs
-    so the file path is always available when Run Pipeline is pressed.
+Key design:
+    Streamlit re-runs the entire script on every interaction (keypress, click, etc.).
+    All pipeline outputs are stored in st.session_state so they survive re-runs.
+    The results section renders from session_state — not from run_btn — so filter
+    inputs never wipe the displayed results.
 """
 
 import json
+import re
 import tempfile
 import os
 import streamlit as st
@@ -24,6 +21,7 @@ import pandas as pd
 from emission_pipeline import (
     load_data,
     filter_by_keyword,
+    deduplicate_activity_ids,
     parse_activity_id,
     aggregate_attributes,
 )
@@ -50,10 +48,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state init ───────────────────────────────────────────────────────
-if "tmp_path" not in st.session_state:
-    st.session_state.tmp_path = None
-if "upload_name" not in st.session_state:
-    st.session_state.upload_name = None
+for key, default in {
+    "tmp_path":    None,
+    "upload_name": None,
+    # Pipeline outputs — persist across re-runs so filters don't reset them
+    "pipeline_result":       None,   # aggregated dict {attr: [values]}
+    "pipeline_output_df":    None,   # flat (Attribute, Value, Type) DataFrame
+    "pipeline_parsed_table": None,   # per-activity_id parsed DataFrame
+    "pipeline_filtered_len": 0,
+    "pipeline_deduped_len":  0,
+    "pipeline_keywords":     [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -103,20 +110,28 @@ def render_attribute_values(values: list):
                 )
 
 
-def build_parsed_table(filtered_df: pd.DataFrame, max_rows: int = 500) -> pd.DataFrame:
-    """
-    Return a DataFrame where each row contains the original activity_id
-    plus all parsed attribute columns side by side.
-
-    Caps at max_rows for display performance.
-    """
-    subset = filtered_df["activity_id"].head(max_rows)
+def build_parsed_table(deduped_df: pd.DataFrame, max_rows: int = 500) -> pd.DataFrame:
+    """One row per unique activity_id with all parsed attribute columns."""
+    subset = deduped_df["activity_id"].head(max_rows)
     rows = []
     for aid in subset:
-        parsed = parse_activity_id(aid)
+        parsed = parse_activity_id(aid) if pd.notna(aid) else {}
         row = {"activity_id": aid}
         row.update(parsed)
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_output_df(result: dict) -> pd.DataFrame:
+    """Explode the aggregated result dict to one row per (attribute, value)."""
+    rows = []
+    for attr, values in sorted(result.items()):
+        for v in values:
+            rows.append({
+                "Attribute": attr,
+                "Value": json.dumps(v, default=str) if isinstance(v, dict) else str(v),
+                "Type": "numeric/range" if isinstance(v, dict) else "string",
+            })
     return pd.DataFrame(rows)
 
 
@@ -142,11 +157,9 @@ with st.sidebar:
                     os.unlink(st.session_state.tmp_path)
                 except OSError:
                     pass
-
             with st.spinner("Saving file to disk …"):
-                st.session_state.tmp_path   = save_upload_chunked(uploaded_file)
+                st.session_state.tmp_path    = save_upload_chunked(uploaded_file)
                 st.session_state.upload_name = uploaded_file.name
-
             st.success(f"Ready: {uploaded_file.name}")
 
     elif uploaded_file is None and st.session_state.tmp_path:
@@ -181,7 +194,8 @@ with st.sidebar:
         st.caption("No file loaded yet.")
 
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+# ── Run pipeline — ONLY when button clicked ───────────────────────────────────
+# All outputs written to session_state so they persist on every subsequent re-run.
 if run_btn:
     if not st.session_state.tmp_path or not os.path.exists(st.session_state.tmp_path):
         st.error("Please upload a dataset file first.")
@@ -198,31 +212,61 @@ if run_btn:
     with st.spinner("Loading dataset …"):
         df = load_data(tmp_path, chunksize=chunk_size)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total records", f"{len(df):,}")
+    # Step 2 — Deduplicate activity_ids FIRST
+    with st.spinner("Deduplicating activity_ids …"):
+        df = deduplicate_activity_ids(df)
 
-    # Step 2 — Filter
+    # Step 3 — Filter
     with st.spinner("Filtering by keyword(s) …"):
         filtered = filter_by_keyword(df, keywords)
-
-    col2.metric("Matched records", f"{len(filtered):,}")
 
     if filtered.empty:
         st.warning("No records matched the given keyword(s).")
         st.stop()
 
-    # Step 3 — Parse + Aggregate
+    # Step 4 — Parse + Aggregate
     with st.spinner("Parsing and aggregating …"):
         parsed = [parse_activity_id(aid) for aid in filtered["activity_id"]]
         parsed = [p for p in parsed if p]
         result = aggregate_attributes(parsed)
 
+    # Step 5 — Build display tables
+    MAX_DISPLAY = 500
+    with st.spinner("Building table view …"):
+        parsed_table = build_parsed_table(filtered, max_rows=MAX_DISPLAY)
+    attr_cols = sorted([c for c in parsed_table.columns if c != "activity_id"])
+    parsed_table = parsed_table[["activity_id"] + attr_cols]
+    output_df = build_output_df(result)
+
+    # ── Persist everything to session_state ──────────────────────────────────
+    st.session_state.pipeline_result       = result
+    st.session_state.pipeline_output_df    = output_df
+    st.session_state.pipeline_parsed_table = parsed_table
+    st.session_state.pipeline_filtered_len = len(filtered)
+    st.session_state.pipeline_deduped_len  = len(df)
+    st.session_state.pipeline_keywords     = keywords
+
+
+# ── Render results — from session_state, survives every re-run / keypress ────
+if st.session_state.pipeline_result is not None:
+
+    result       = st.session_state.pipeline_result
+    output_df    = st.session_state.pipeline_output_df
+    parsed_table = st.session_state.pipeline_parsed_table
+    keywords     = st.session_state.pipeline_keywords
+    MAX_DISPLAY  = 500
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Unique activity IDs", f"{st.session_state.pipeline_deduped_len:,}",
+                help="After deduplication — one row per distinct activity_id")
+    col2.metric("Matched (filtered)", f"{st.session_state.pipeline_filtered_len:,}")
     col3.metric("Attributes found", f"{len(result):,}")
     st.success(f"Pipeline complete — {len(result)} attributes extracted.")
     st.divider()
 
-    # ── Results tabs ────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Attributes", "🗂 Raw JSON", "🔍 Sample Records", "🆔 Activity IDs"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Attributes", "🗂 Raw JSON", "🔍 Sample Records", "🆔 Activity IDs", "📋 Table View"
+    ])
 
     with tab1:
         summary_rows = [
@@ -237,12 +281,15 @@ if run_btn:
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
         st.divider()
 
-        search = st.text_input("🔎 Filter attributes by name", placeholder="e.g. fuel, weight, type")
+        search = st.text_input(
+            "🔎 Filter attributes by name",
+            placeholder="e.g. fuel, weight, type",
+            key="tab1_search",
+        )
         filtered_attrs = {
             attr: values for attr, values in sorted(result.items())
             if not search or search.lower() in attr.lower()
         }
-
         if not filtered_attrs:
             st.info("No attributes match your filter.")
         else:
@@ -264,26 +311,13 @@ if run_btn:
 
     with tab3:
         st.subheader("Sample Records — activity_id + Parsed Attributes")
-
-        MAX_DISPLAY = 500
-        total_matched = len(filtered)
+        total_matched = st.session_state.pipeline_filtered_len
         display_count = min(total_matched, MAX_DISPLAY)
-
         st.caption(
-            f"Showing {display_count:,} of {total_matched:,} matched records. "
+            f"Showing {display_count:,} of {total_matched:,} unique activity_ids. "
             f"Each column is a parsed attribute extracted from the activity_id."
         )
-
-        with st.spinner(f"Parsing {display_count:,} records for display …"):
-            parsed_table = build_parsed_table(filtered, max_rows=MAX_DISPLAY)
-
-        # Put activity_id first, then sort remaining columns alphabetically
-        attr_cols = sorted([c for c in parsed_table.columns if c != "activity_id"])
-        parsed_table = parsed_table[["activity_id"] + attr_cols]
-
         st.dataframe(parsed_table, use_container_width=True, hide_index=True)
-
-        # Download the full parsed table as CSV
         csv_data = parsed_table.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇ Download displayed records as CSV",
@@ -294,17 +328,14 @@ if run_btn:
 
     with tab4:
         st.subheader("🆔 Matched Activity IDs")
-        st.caption(f"{len(filtered):,} activity_id strings matched your keyword(s).")
+        all_ids = parsed_table["activity_id"].dropna().tolist()
+        st.caption(f"{len(all_ids):,} unique activity_ids matched your keyword(s).")
 
-        # Live search within the matched IDs
         aid_search = st.text_input(
             "🔎 Search within activity IDs",
             placeholder="e.g. diesel, hgv, gt_20t",
             key="aid_search",
         )
-
-        all_ids = filtered["activity_id"].dropna().tolist()
-
         if aid_search.strip():
             display_ids = [a for a in all_ids if aid_search.lower() in a.lower()]
             st.caption(f"Showing {len(display_ids):,} results matching '{aid_search}'")
@@ -312,17 +343,65 @@ if run_btn:
             display_ids = all_ids
             st.caption(f"Showing all {len(display_ids):,} matched activity IDs")
 
-        # Render as a numbered dataframe so IDs are easy to read and copy
         aid_df = pd.DataFrame({"#": range(1, len(display_ids) + 1), "activity_id": display_ids})
         st.dataframe(aid_df, use_container_width=True, hide_index=True, height=500)
-
-        # Download button
         st.download_button(
             "⬇ Download all matched activity IDs as CSV",
             data="\n".join(display_ids).encode("utf-8"),
             file_name=f"{'_'.join(keywords)}_activity_ids.csv",
             mime="text/csv",
         )
+
+    with tab5:
+        st.subheader("📋 Final Output — Table View")
+        st.caption(
+            "Final extracted output: one row per **(attribute, value)** pair, "
+            "aggregated across all matched activity_ids. "
+            "Typing in the filter updates the table instantly — no pipeline re-run."
+        )
+
+        # ── Filter controls ──────────────────────────────────────────────────
+        fcol1, fcol2 = st.columns([1, 2])
+        with fcol1:
+            filter_column = st.selectbox(
+                "Filter by column",
+                options=["Attribute", "Value", "Type"],
+                index=0,
+                key="tbl5_filter_col",
+            )
+        with fcol2:
+            filter_value = st.text_input(
+                "Contains (case-insensitive)",
+                placeholder="e.g. fuel_source, diesel, hgv …",
+                key="tbl5_filter_val",
+            )
+
+        # ── Apply filter to the already-computed output_df ───────────────────
+        tbl5_filtered = output_df.copy()
+        if filter_value.strip():
+            tbl5_filtered = tbl5_filtered[
+                tbl5_filtered[filter_column]
+                .astype(str)
+                .str.contains(re.escape(filter_value.strip()), case=False, na=False)
+            ]
+
+        # ── Stats ────────────────────────────────────────────────────────────
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total attributes", f"{len(result):,}")
+        m2.metric("Total values", f"{len(output_df):,}")
+        m3.metric("Rows after filter", f"{len(tbl5_filtered):,}")
+
+        if tbl5_filtered.empty:
+            st.warning("No rows match the current filter.")
+        else:
+            st.dataframe(tbl5_filtered, use_container_width=True, hide_index=True, height=480)
+            csv_tbl5 = tbl5_filtered.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇ Download filtered output as CSV",
+                data=csv_tbl5,
+                file_name=f"{'_'.join(keywords)}_final_output.csv",
+                mime="text/csv",
+            )
 
 else:
     st.info("Upload a dataset file and enter a keyword, then click **Run Pipeline**.")
