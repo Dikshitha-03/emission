@@ -208,35 +208,55 @@ if run_btn:
     keywords = [k.strip() for k in keyword_input.split(",") if k.strip()]
     tmp_path = st.session_state.tmp_path
 
-    # Step 1 — Load
-    with st.spinner("Loading dataset …"):
-        df = load_data(tmp_path, chunksize=chunk_size)
+    try:
+        # Step 1 — Load
+        with st.spinner("Loading dataset …"):
+            df = load_data(tmp_path, chunksize=chunk_size)
 
-    # Step 2 — Deduplicate activity_ids FIRST
-    with st.spinner("Deduplicating activity_ids …"):
-        df = deduplicate_activity_ids(df)
+        # Step 2 — Deduplicate activity_ids FIRST
+        with st.spinner("Deduplicating activity_ids …"):
+            df = deduplicate_activity_ids(df)
 
-    # Step 3 — Filter
-    with st.spinner("Filtering by keyword(s) …"):
-        filtered = filter_by_keyword(df, keywords)
+        # Step 3 — Filter
+        with st.spinner("Filtering by keyword(s) …"):
+            filtered = filter_by_keyword(df, keywords)
 
-    if filtered.empty:
-        st.warning("No records matched the given keyword(s).")
+        if filtered.empty:
+            st.warning("No records matched the given keyword(s). Try a different keyword.")
+            st.stop()
+
+        # Step 4 — Parse + Aggregate
+        with st.spinner("Parsing and aggregating …"):
+            parsed = [parse_activity_id(aid) for aid in filtered["activity_id"]]
+            parsed = [p for p in parsed if p]
+            result = aggregate_attributes(parsed)
+
+        # Step 5 — Build display tables
+        MAX_DISPLAY = 500
+        with st.spinner("Building table view …"):
+            parsed_table = build_parsed_table(filtered, max_rows=MAX_DISPLAY)
+        attr_cols = sorted([c for c in parsed_table.columns if c != "activity_id"])
+        parsed_table = parsed_table[["activity_id"] + attr_cols]
+        output_df = build_output_df(result)
+
+    except (FileNotFoundError, ValueError) as exc:
+        st.error(f"**Pipeline error:** {exc}")
+        st.caption(
+            "Common causes: wrong file format, missing `activity_id` field, "
+            "corrupted or incomplete upload. Check the error above for specifics."
+        )
         st.stop()
-
-    # Step 4 — Parse + Aggregate
-    with st.spinner("Parsing and aggregating …"):
-        parsed = [parse_activity_id(aid) for aid in filtered["activity_id"]]
-        parsed = [p for p in parsed if p]
-        result = aggregate_attributes(parsed)
-
-    # Step 5 — Build display tables
-    MAX_DISPLAY = 500
-    with st.spinner("Building table view …"):
-        parsed_table = build_parsed_table(filtered, max_rows=MAX_DISPLAY)
-    attr_cols = sorted([c for c in parsed_table.columns if c != "activity_id"])
-    parsed_table = parsed_table[["activity_id"] + attr_cols]
-    output_df = build_output_df(result)
+    except ImportError as exc:
+        st.error(f"**Missing dependency:** {exc}")
+        st.caption("Run `pip install ijson` in your environment and restart the app.")
+        st.stop()
+    except Exception as exc:
+        st.error(f"**Unexpected error:** {type(exc).__name__}: {exc}")
+        st.caption(
+            "Please share this error message with your developer. "
+            "If you are the developer, check the terminal logs for the full traceback."
+        )
+        st.stop()
 
     # ── Persist everything to session_state ──────────────────────────────────
     st.session_state.pipeline_result       = result

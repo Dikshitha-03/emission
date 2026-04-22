@@ -102,12 +102,45 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
 
     IS_FIXTURE_KEY = "fields"   # Django fixture marker
 
+    # ── Peek at the raw bytes to give early, specific error messages ──────────
+    try:
+        with open_fn(filepath, "rb") as f:
+            peek = f.read(512).strip()
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot open '{Path(filepath).name}': {exc}\n"
+            "Check the file is not corrupted and is a valid .json or .json.gz file."
+        ) from exc
+
+    if not peek:
+        raise ValueError(
+            f"'{Path(filepath).name}' appears to be empty (0 bytes after decompression)."
+        )
+    if peek[0:1] not in (b"[", b"{"):
+        raise ValueError(
+            f"'{Path(filepath).name}' does not look like JSON — "
+            f"first character is '{peek[0:1].decode('utf-8', errors='replace')}', expected '[' or '{{'.\n"
+            "Make sure you uploaded the correct file."
+        )
+    if peek[0:1] == b"{":
+        raise ValueError(
+            f"'{Path(filepath).name}' is a JSON object (starts with '{{'), "
+            "but the pipeline expects a JSON array (starts with '[').\n"
+            "The file should be a list of records: [ {{...}}, {{...}}, ... ]"
+        )
+
+    # ── Stream and parse ──────────────────────────────────────────────────────
+    items_seen   = 0
+    items_no_aid = 0
+
     try:
         with open_fn(filepath, "rb") as f:
             detected_format = None
             for raw_item in ijson.items(f, "item"):
                 if not isinstance(raw_item, dict):
                     continue
+
+                items_seen += 1
 
                 # Detect format on first item
                 if detected_format is None:
@@ -120,7 +153,6 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
                 # Flatten to a single record dict
                 if detected_format == "fixture":
                     record: dict = dict(raw_item.get(IS_FIXTURE_KEY, {}))
-                    # Carry over top-level fixture keys (pk, model) as metadata
                     if "pk" in raw_item:
                         record.setdefault("_pk", raw_item["pk"])
                 else:
@@ -128,6 +160,7 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
 
                 # Must have an activity_id to be useful
                 if "activity_id" not in record:
+                    items_no_aid += 1
                     continue
 
                 buffer.append(record)
@@ -135,15 +168,34 @@ def load_data(filepath: str, chunksize: int = 50_000) -> pd.DataFrame:
                     _flush()
 
     except (OSError, UnicodeDecodeError) as exc:
-        raise ValueError(f"Failed to read {filepath}: {exc}") from exc
+        raise ValueError(
+            f"Failed to read '{Path(filepath).name}': {exc}\n"
+            "The file may be corrupted or incompletely uploaded."
+        ) from exc
+    except Exception as exc:
+        # Catch ijson parse errors (JSONError, IncompleteJSONError, etc.)
+        raise ValueError(
+            f"JSON parse error in '{Path(filepath).name}': {exc}\n"
+            "The file may be malformed or truncated."
+        ) from exc
 
     if buffer:
         chunks.append(pd.DataFrame(buffer))
 
     if not chunks:
+        if items_seen == 0:
+            raise ValueError(
+                f"No records found in '{Path(filepath).name}'.\n"
+                "The file parsed as valid JSON but contained no array items. "
+                "Expected: [ {{...}}, {{...}}, ... ]"
+            )
         raise ValueError(
-            "No activity_id values found. "
-            "Expected a Django fixture or flat JSON array with an 'activity_id' field."
+            f"Parsed {items_seen:,} records from '{Path(filepath).name}' "
+            f"but none contained an 'activity_id' field "
+            f"({items_no_aid:,} records had no 'activity_id').\n"
+            "Check that this is the correct emission factors dataset file. "
+            "Expected either a Django fixture with 'fields.activity_id' "
+            "or a flat array with 'activity_id' at the top level."
         )
 
     df = pd.concat(chunks, ignore_index=True)
